@@ -13,8 +13,11 @@
 #include "./stdutil/concepts.hpp"
 #include "./traits.hpp"
 
+#include <itertools/itertools.hpp>
+
 #include <array>
 #include <concepts>
+#include <ranges>
 #include <type_traits>
 #include <utility>
 
@@ -312,6 +315,27 @@ namespace nda {
    */
   template <typename A, typename U>
   concept HasValueTypeConstructibleFrom = Array<A> and (std::is_constructible_v<U, get_value_t<A>>);
+
+  /**
+   * @brief Check if a given type is an index container for advanced array indexing.
+   *
+   * @details An index container is a sized range of integers that can be used for advanced
+   * (NumPy-style) array indexing. The container provides a set of indices to select arbitrary
+   * elements along a dimension.
+   *
+   * Examples of types satisfying this concept are `std::vector<long>`, `std::array<long, N>`,
+   * and `std::span<long>`.
+   *
+   * @note This concept explicitly excludes types that are convertible to `long` (single indices)
+   * or that represent range-like slicing operations (itertools::range, nda::ellipsis).
+   *
+   * @tparam T Type to check.
+   */
+  template <typename T>
+  concept IndexContainer = std::ranges::sized_range<T>                                 //
+                           && std::convertible_to<std::ranges::range_value_t<T>, long> //
+                           && (!std::convertible_to<T, long>)                          //
+                           && (!std::is_same_v<std::remove_cvref_t<T>, itertools::range>);
 
   /** @} */
 

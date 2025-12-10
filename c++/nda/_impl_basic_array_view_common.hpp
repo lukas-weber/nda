@@ -186,6 +186,12 @@ FORCEINLINE static decltype(auto) call(Self &&self, Ts const &...idxs) noexcept(
   } else if constexpr (sizeof...(Ts) == 0) {
     // if no arguments are given, a full view is returned
     return basic_array_view<r_v_t, Rank, LayoutPolicy, Algebra, AccessorPolicy, OwningPolicy>{self.lay, self.sto};
+  } else if constexpr (detail::has_index_container<Ts...>) {
+    // if any argument is an IndexContainer, return an expr_indexed for advanced indexing
+    auto view                   = self(detail::make_view_arg_for_indexed(idxs)...);
+    auto idx_tuple              = detail::filter_and_convert(idxs...);
+    constexpr auto indexed_dims = detail::compute_indexed_dims<Ts...>();
+    return expr_indexed{std::move(view), std::move(idx_tuple), indexed_dims};
   } else {
     // otherwise we check the arguments and either access a single element or make a slice
     static_assert(((layout_t::template argument_is_allowed_for_call_or_slice<Ts> + ...) > 0),
