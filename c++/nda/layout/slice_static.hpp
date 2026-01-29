@@ -30,7 +30,8 @@ namespace nda {
 
   /// @cond
   // Forward declarations.
-  template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+  template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp,
+            std::array<long, Rank> StaticStridesParam>
   class idx_map;
   /// @endcond
 
@@ -222,6 +223,50 @@ namespace nda::slice_static {
     // nda::ellipsis..
     FORCEINLINE long get_stride(range::all_t, long original_str) { return original_str; }
 
+    // Get the contribution to the flat index of the first element of the slice from a single dimension if the argument
+    // is a static_range.
+    template <long First, long Last, long Step>
+    FORCEINLINE long get_offset(static_range<First, Last, Step>, long stride) {
+      return First * stride;
+    }
+
+    // Get the length of the slice for a single dimension if the argument is a static_range.
+    template <long First, long Last, long Step>
+    FORCEINLINE long get_length(static_range<First, Last, Step>, long) {
+      return static_range<First, Last, Step>::extent();
+    }
+
+    // Get the stride of the slice for a single dimension if the argument is a static_range.
+    template <long First, long Last, long Step>
+    FORCEINLINE long get_stride(static_range<First, Last, Step>, long original_str) {
+      return original_str * Step;
+    }
+
+    // Helper to compute static extent for a single argument in the slice.
+    template <typename Arg, int orig_static_extent>
+    constexpr int compute_arg_static_extent() {
+      using T = std::remove_cvref_t<Arg>;
+      if constexpr (std::is_base_of_v<range::all_t, T>)
+        return orig_static_extent; // range::all or ellipsis: preserve original static extent
+      else if constexpr (is_static_range_v<T>)
+        return static_cast<int>(T::extent()); // static_range: use compile-time extent
+      else
+        return 0; // dynamic range: extent is dynamic
+    }
+
+    // Helper to get the compile-time step for a slice argument type.
+    // Returns non-zero for static arguments (static_range or range::all_t), 0 for dynamic (range or long).
+    template <typename Arg>
+    constexpr long get_static_step() {
+      using T = std::remove_cvref_t<Arg>;
+      if constexpr (nda::is_static_range_v<T>)
+        return T::step_value;
+      else if constexpr (std::is_base_of_v<nda::range::all_t, T>)
+        return 1;
+      else
+        return 0; // Dynamic (range) or scalar (long)
+    }
+
     // Helper function to determine the resulting index map when taking a slice of a given index map.
     template <size_t... Ps, size_t... Ns, typename IdxMap, typename... Args>
     FORCEINLINE auto slice_idx_map_impl(std::index_sequence<Ps...>, std::index_sequence<Ns...>, IdxMap const &idxm, Args const &...args) {
@@ -240,11 +285,14 @@ namespace nda::slice_static {
       static constexpr int e_len = N - Q + 1;
       static constexpr int e_pos = ellipsis_position<Args...>();
 
-      // is i-th argument a range/range::all_t/ellipsis?
-      static constexpr std::array<bool, Q> args_is_range{(std::is_same_v<Args, range> or std::is_base_of_v<range::all_t, Args>)...};
+      // is i-th argument a range/range::all_t/ellipsis/static_range?
+      static constexpr std::array<bool, Q> args_is_range{
+         (std::is_same_v<Args, range> or std::is_base_of_v<range::all_t, Args> or is_static_range_v<Args>)...};
 
-      // is i-th argument a range::all_t/ellipsis?
-      static constexpr std::array<bool, Q> args_is_rangeall{(std::is_base_of_v<range::all_t, Args>)...};
+      // is i-th argument a range::all_t/ellipsis (preserves contiguity)?
+      // Note: static_range does NOT preserve contiguity even with step=1, because it changes the extent
+      // while keeping the original stride, which can make a previously contiguous slice non-contiguous.
+      static constexpr std::array<bool, Q> args_is_rangeall{std::is_base_of_v<range::all_t, Args>...};
 
       // mapping between the dimensions of the resulting index map and the dimensions of the original index map
       static constexpr std::array<int, P> n_of_p = n_of_p_map<N, P>(args_is_range, e_pos, e_len);
@@ -266,22 +314,39 @@ namespace nda::slice_static {
       std::array<long, P> len{get_length(std::get<q_of_p[Ps]>(argstie), std::get<n_of_p[Ps]>(idxm.lengths()))...};
       std::array<long, P> str{get_stride(std::get<q_of_p[Ps]>(argstie), std::get<n_of_p[Ps]>(idxm.strides()))...};
 
-      // static extents of the resulting index map: 0 (= dynamic extent) if the corresponding argument is not a
-      // range/range::all_t/ellipsis
-      static constexpr std::array<int, P> new_static_extents{(args_is_rangeall[q_of_p[Ps]] ? IdxMap::static_extents[n_of_p[Ps]] : 0)...};
+      // static extents of the resulting index map: computed from static_range or preserved from range::all_t/ellipsis
+      static constexpr std::array<int, P> new_static_extents{
+         compute_arg_static_extent<std::tuple_element_t<q_of_p[Ps], std::tuple<Args...>>, IdxMap::static_extents[n_of_p[Ps]]>()...};
 
       // stride order of the resulting index map
       static constexpr std::array<int, P> new_stride_order = slice_stride_order(IdxMap::stride_order, n_of_p);
 
       // compile-time layout properties of the resulting index map
-      static constexpr bool has_only_rangeall_and_long = ((std::is_constructible_v<long, Args> or std::is_base_of_v<range::all_t, Args>) and ...);
+      // Note: static_range does NOT preserve layout properties - it changes the extent while keeping
+      // the original stride, breaking contiguity even with step=1.
+      static constexpr bool has_only_rangeall_and_long = ((std::is_constructible_v<long, Args> || std::is_base_of_v<range::all_t, Args>) && ...);
       static constexpr layout_prop_e li =
          slice_layout_prop(P, has_only_rangeall_and_long, args_is_rangeall, IdxMap::stride_order, IdxMap::layout_prop, e_pos, e_len);
+
+      // Compile-time steps for each slice argument.
+      static constexpr std::array<long, Q> steps{get_static_step<Args>()...};
+
+      // Compute static strides for the resulting idx_map when slicing from a fully static idx_map
+      // with static slice arguments (static_range or range::all_t).
+      static constexpr std::array<long, P> new_static_strides = []() {
+        if constexpr (!IdxMap::is_fully_static) return std::array<long, P>{};
+        std::array<long, P> result{};
+        for (int p = 0; p < P; ++p) {
+          if (steps[q_of_p[p]] == 0) return std::array<long, P>{}; // Has dynamic slice arg
+          result[p] = IdxMap::static_strides[n_of_p[p]] * steps[q_of_p[p]];
+        }
+        return result;
+      }();
 
       // return the resulting index map
       static constexpr uint64_t new_static_extents_encoded = encode(new_static_extents);
       static constexpr uint64_t new_stride_order_encoded   = encode(new_stride_order);
-      return std::make_pair(offset, idx_map<P, new_static_extents_encoded, new_stride_order_encoded, li>{len, str});
+      return std::make_pair(offset, idx_map<P, new_static_extents_encoded, new_stride_order_encoded, li, new_static_strides>{len, str});
     }
 
   } // namespace detail
@@ -310,8 +375,8 @@ namespace nda::slice_static {
    * @param args Arguments consisting of `long`, `nda::range`, `nda::range::all_t` or nda::ellipsis objects.
    * @return Resulting nda::idx_map of the slice.
    */
-  template <int R, uint64_t SE, uint64_t SO, layout_prop_e LP, typename... Args>
-  FORCEINLINE decltype(auto) slice_idx_map(idx_map<R, SE, SO, LP> const &idxm, Args const &...args) {
+  template <int R, uint64_t SE, uint64_t SO, layout_prop_e LP, auto SS, typename... Args>
+  FORCEINLINE decltype(auto) slice_idx_map(idx_map<R, SE, SO, LP, SS> const &idxm, Args const &...args) {
     // number of ellipsis and long arguments
     static constexpr int n_args_ellipsis = ((std::is_same_v<Args, ellipsis>)+...);
     static constexpr int n_args_long     = (std::is_constructible_v<long, Args> + ...);

@@ -29,7 +29,8 @@ namespace nda {
 
   /// @cond
   // Forward declarations.
-  template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+  template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp,
+            std::array<long, Rank> StaticStridesParam>
   class idx_map;
 
   template <typename ValueType, int Rank, typename Layout, char Algebra, typename ContainerPolicy>

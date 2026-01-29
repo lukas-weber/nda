@@ -14,6 +14,7 @@
 #include "./range.hpp"
 #include "./slice_static.hpp"
 #include "../macros.hpp"
+#include "../stdutil/array.hpp"
 #include "../traits.hpp"
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <functional>
 #include <numeric>
+#include <ranges>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -34,6 +36,57 @@ namespace nda {
    * @addtogroup layout_idx
    * @{
    */
+
+  namespace detail {
+
+    /**
+     * @brief Compute contiguous strides at compile-time from static extents and stride order.
+     *
+     * @tparam Rank Number of dimensions.
+     * @param extents Static extents of each dimension.
+     * @param stride_order Order of dimensions from slowest to fastest.
+     * @return Contiguous strides computed from the extents and stride order.
+     */
+    template <int Rank>
+    constexpr std::array<long, Rank> compute_strides_from_extents(std::array<int, Rank> const &extents,
+                                                                   std::array<int, Rank> const &stride_order) {
+      std::array<long, Rank> strides{};
+      long s = 1;
+      for (int v = Rank - 1; v >= 0; --v) {
+        int u      = stride_order[v];
+        strides[u] = s;
+        s *= extents[u];
+      }
+      return strides;
+    }
+
+    /**
+     * @brief Storage for idx_map lengths and strides (dynamic case).
+     * @tparam Rank Number of dimensions.
+     * @tparam IsFullyStatic Whether all extents are static and layout is contiguous.
+     */
+    template <int Rank, bool IsFullyStatic>
+    struct idx_map_storage {
+      std::array<long, Rank> len{};
+      std::array<long, Rank> str{};
+
+      idx_map_storage() = default;
+      explicit idx_map_storage(std::array<long, Rank> const &l) : len(l) {}
+      idx_map_storage(std::array<long, Rank> const &l, std::array<long, Rank> const &s) : len(l), str(s) {}
+    };
+
+    /**
+     * @brief Empty storage for idx_map when fully static (zero overhead).
+     * @tparam Rank Number of dimensions.
+     */
+    template <int Rank>
+    struct alignas(alignof(long)) idx_map_storage<Rank, true> {
+      idx_map_storage() = default;
+      explicit idx_map_storage(std::array<long, Rank> const &) {}
+      idx_map_storage(std::array<long, Rank> const &, std::array<long, Rank> const &) {}
+    };
+
+  } // namespace detail
 
   /**
    * @brief Fortran/Column-major stride order.
@@ -86,16 +139,11 @@ namespace nda {
    * @tparam StrideOrder Order in which the dimensions are stored in memory.
    * @tparam LayoutProp Compile-time guarantees about the layout of the data in memory.
    */
-  template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+  template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp,
+            std::array<long, Rank> StaticStridesParam = std::array<long, Rank>{}>
   class idx_map {
     static_assert(Rank <= 8, "Error in nda::idx_map: Rank must be <= 8");
     static_assert((StrideOrder != 0) or (Rank == 1), "Error in nda::idx_map: StrideOrder can only be zero for 1D arrays");
-
-    // Extents of all dimensions (the shape of the map).
-    std::array<long, Rank> len{};
-
-    // Strides of all dimensions.
-    std::array<long, Rank> str{};
 
     public:
     /// Encoded static extents.
@@ -123,15 +171,37 @@ namespace nda {
     /// Alias template to check if type `T` can be used to either access a single element or a slice of elements.
     template <typename T>
     static constexpr int argument_is_allowed_for_call_or_slice =
-       std::is_same_v<range, T> or std::is_same_v<range::all_t, T> or std::is_same_v<ellipsis, T> or std::is_constructible_v<long, T>;
+       std::is_same_v<range, T> or std::is_same_v<range::all_t, T> or std::is_same_v<ellipsis, T> or std::is_constructible_v<long, T>
+       or is_static_range_v<T>;
 
-    protected:
     /// Number of dynamic dimensions/extents.
-    static constexpr int n_dynamic_extents = []() {
-      int r = 0;
-      for (int u = 0; u < Rank; ++u) r += (static_extents[u] == 0 ? 1 : 0);
-      return r;
+    static constexpr int n_dynamic_extents = std::ranges::count(static_extents, 0);
+
+    /// Check if static strides are explicitly provided (all non-zero).
+    static constexpr bool has_static_strides_provided = std::ranges::none_of(StaticStridesParam, [](long s) { return s == 0; });
+
+    /// True if all extents are static and strides are known at compile-time.
+    static constexpr bool is_fully_static =
+       (n_dynamic_extents == 0) && (has_contiguous(LayoutProp) || has_static_strides_provided);
+
+    /// Compile-time lengths (converted from static_extents).
+    static constexpr std::array<long, Rank> static_lengths = stdutil::make_std_array<long>(static_extents);
+
+    /// Compile-time strides (valid when is_fully_static).
+    static constexpr std::array<long, Rank> static_strides = []() {
+      if constexpr (n_dynamic_extents == 0) {
+        if constexpr (has_static_strides_provided)
+          return StaticStridesParam;
+        else if constexpr (has_contiguous(LayoutProp))
+          return detail::compute_strides_from_extents<Rank>(static_extents, stride_order);
+      }
+      return std::array<long, Rank>{};
     }();
+
+    private:
+    // Conditional storage: empty when fully static, otherwise stores len and str arrays.
+    // Note: [[no_unique_address]] removed to avoid alignment issues with subsequent members.
+    detail::idx_map_storage<Rank, is_fully_static> storage_;
 
     public:
     /**
@@ -144,7 +214,12 @@ namespace nda {
      * @brief Get the total number of elements.
      * @return Product of the extents of all dimensions.
      */
-    [[nodiscard]] long size() const noexcept { return std::accumulate(len.cbegin(), len.cend(), 1L, std::multiplies<>{}); }
+    [[nodiscard]] long size() const noexcept {
+      if constexpr (is_fully_static)
+        return ce_size();
+      else
+        return std::accumulate(storage_.len.cbegin(), storage_.len.cend(), 1L, std::multiplies<>{});
+    }
 
     /**
      * @brief Get the size known at compile-time.
@@ -162,19 +237,29 @@ namespace nda {
      * @brief Get the extents of all dimensions.
      * @return `std::array<long, Rank>` containing the extent of each dimension.
      */
-    [[nodiscard]] std::array<long, Rank> const &lengths() const noexcept { return len; }
+    [[nodiscard]] constexpr std::array<long, Rank> const &lengths() const noexcept {
+      if constexpr (n_dynamic_extents == 0)
+        return static_lengths;
+      else
+        return storage_.len;
+    }
 
     /**
      * @brief Get the strides of all dimensions.
      * @return `std::array<long, Rank>` containing the stride of each dimension.
      */
-    [[nodiscard]] std::array<long, Rank> const &strides() const noexcept { return str; }
+    [[nodiscard]] constexpr std::array<long, Rank> const &strides() const noexcept {
+      if constexpr (is_fully_static)
+        return static_strides;
+      else
+        return storage_.str;
+    }
 
     /**
      * @brief Get the value of the smallest stride (positive or negative).
      * @return Stride of the fastest varying dimension.
      */
-    [[nodiscard]] long min_stride() const noexcept { return str[stride_order[Rank - 1]]; }
+    [[nodiscard]] long min_stride() const noexcept { return strides()[stride_order[Rank - 1]]; }
 
     /**
      * @brief Is the data contiguous in memory?
@@ -186,16 +271,20 @@ namespace nda {
      * @return True if the data is contiguous in memory, false otherwise.
      */
     [[nodiscard]] bool is_contiguous() const noexcept {
+      if constexpr (is_fully_static) return true;
       auto s = size();
       if (s == 0) return true;
-      return (std::abs(str[stride_order[0]] * len[stride_order[0]]) == s);
+      return (std::abs(strides()[stride_order[0]] * lengths()[stride_order[0]]) == s);
     }
 
     /**
      * @brief Are all strides positive?
      * @return True if all strides are positive, false otherwise.
      */
-    [[nodiscard]] bool has_positive_strides() const noexcept { return (*std::min_element(str.cbegin(), str.cend()) >= 0); }
+    [[nodiscard]] bool has_positive_strides() const noexcept {
+      auto const &s = strides();
+      return (*std::min_element(s.cbegin(), s.cend()) >= 0);
+    }
 
     /**
      * @brief Is the data strided in memory with a constant stride?
@@ -208,11 +297,14 @@ namespace nda {
      * @return True if the data is strided in memory with a constant stride, false otherwise.
      */
     [[nodiscard]] bool is_strided_1d() const noexcept {
-      auto s = size();
+      if constexpr (is_fully_static) return true;
+      auto const &l = lengths();
+      auto const &t = strides();
+      auto s        = size();
       if (s == 0) return true;
       int i = Rank - 1;
-      while (len[stride_order[i]] == 1 and i > 0) --i;
-      return (std::abs(str[stride_order[0]] * len[stride_order[0]]) == s * std::abs(str[stride_order[i]]));
+      while (l[stride_order[i]] == 1 and i > 0) --i;
+      return (std::abs(t[stride_order[0]] * l[stride_order[0]]) == s * std::abs(t[stride_order[i]]));
     }
 
     /**
@@ -251,28 +343,44 @@ namespace nda {
      * @details See idx_map::is_stride_order_valid(Int *lenptr, Int *strptr)).
      * @return True if the shape and strides are compatible with the stride order.
      */
-    [[nodiscard]] bool is_stride_order_valid() const { return is_stride_order_valid(len.data(), str.data()); }
+    [[nodiscard]] bool is_stride_order_valid() const { return is_stride_order_valid(lengths().data(), strides().data()); }
 
     private:
-    // Compute contiguous strides from the shape.
+    // Compute contiguous strides from the shape (only for non-static case).
     void compute_strides_contiguous() {
-      long s = 1;
-      for (int v = rank() - 1; v >= 0; --v) {
-        int u  = stride_order[v];
-        str[u] = s;
-        s *= len[u];
+      if constexpr (!is_fully_static) {
+        long s = 1;
+        for (int v = rank() - 1; v >= 0; --v) {
+          int u            = stride_order[v];
+          storage_.str[u] = s;
+          s *= storage_.len[u];
+        }
+        ENSURES(s == size());
       }
-      ENSURES(s == size());
     }
 
     // Check that the static extents and the shape are compatible.
     void assert_static_extents_and_len_are_compatible() const {
 #ifdef NDA_ENFORCE_BOUNDCHECK
-      if constexpr (n_dynamic_extents != Rank) {
+      if constexpr (n_dynamic_extents != Rank and n_dynamic_extents != 0) {
 #ifndef NDEBUG
+        auto const &l = lengths();
         for (int u = 0; u < Rank; ++u)
-          if (static_extents[u] != 0) EXPECTS(static_extents[u] == len[u]);
+          if (static_extents[u] != 0) EXPECTS(static_extents[u] == l[u]);
 #endif
+      }
+#endif
+    }
+
+    // Check that the given shape matches the static extents.
+    template <std::integral Int>
+    void assert_shape_matches_static_extents([[maybe_unused]] std::array<Int, Rank> const &shape) const {
+#ifndef NDEBUG
+      if constexpr (n_dynamic_extents != Rank) {
+        for (int u = 0; u < Rank; ++u)
+          if (static_extents[u] != 0)
+            EXPECTS_WITH_MESSAGE(static_extents[u] == static_cast<long>(shape[u]),
+                                 "Error in nda::idx_map: Shape does not match static extents");
       }
 #endif
     }
@@ -303,10 +411,12 @@ namespace nda {
      * For all other maps, the shape is set to zero and the strides are not initialized.
      */
     idx_map() {
-      if constexpr (n_dynamic_extents == 0) {
-        for (int u = 0; u < Rank; ++u) len[u] = static_extents[u];
+      if constexpr (n_dynamic_extents == 0 and !is_fully_static) {
+        // Non-contiguous but fully static: initialize storage from static extents
+        for (int u = 0; u < Rank; ++u) storage_.len[u] = static_extents[u];
         compute_strides_contiguous();
       }
+      // For is_fully_static case: nothing to initialize (lengths/strides are static constexpr)
     }
 
     /**
@@ -316,7 +426,7 @@ namespace nda {
      * @param idxm Other nda::idx_map object.
      */
     template <layout_prop_e LP>
-    idx_map(idx_map<Rank, StaticExtents, StrideOrder, LP> const &idxm) noexcept : len(idxm.lengths()), str(idxm.strides()) {
+    idx_map(idx_map<Rank, StaticExtents, StrideOrder, LP> const &idxm) noexcept : storage_(idxm.lengths(), idxm.strides()) {
       // check strides and stride order of the constructed map
       EXPECTS(is_stride_order_valid());
 
@@ -339,7 +449,35 @@ namespace nda {
      * @param idxm Other nda::idx_map object.
      */
     template <uint64_t SE, layout_prop_e LP>
-    idx_map(idx_map<Rank, SE, StrideOrder, LP> const &idxm) noexcept(false) : len(idxm.lengths()), str(idxm.strides()) {
+    idx_map(idx_map<Rank, SE, StrideOrder, LP> const &idxm) noexcept(false) : storage_(idxm.lengths(), idxm.strides()) {
+      // check strides and stride order
+      EXPECTS(is_stride_order_valid());
+
+      // check that the layout properties are compatible
+      if constexpr (not layout_property_compatible(LP, LayoutProp)) {
+        if constexpr (has_contiguous(LayoutProp)) {
+          EXPECTS_WITH_MESSAGE(idxm.is_contiguous(), "Error in nda::idx_map: Constructing a contiguous from a non-contiguous layout");
+        }
+        if constexpr (has_strided_1d(LayoutProp)) {
+          EXPECTS_WITH_MESSAGE(idxm.is_strided_1d(), "Error in nda::idx_map: Constructing a strided_1d from a non-strided_1d layout");
+        }
+      }
+
+      // check that the static extents and the shape are compatible
+      assert_static_extents_and_len_are_compatible();
+    }
+
+    /**
+     * @brief Construct a new map from an existing map with different static strides (and potentially other parameters).
+     *
+     * @tparam SE Static extents of the other nda::idx_map.
+     * @tparam LP Layout properties of the other nda::idx_map.
+     * @tparam SS Static strides of the other nda::idx_map.
+     * @param idxm Other nda::idx_map object.
+     */
+    template <uint64_t SE, layout_prop_e LP, auto SS>
+      requires(SS != StaticStridesParam)
+    idx_map(idx_map<Rank, SE, StrideOrder, LP, SS> const &idxm) noexcept(false) : storage_(idxm.lengths(), idxm.strides()) {
       // check strides and stride order
       EXPECTS(is_stride_order_valid());
 
@@ -365,8 +503,9 @@ namespace nda {
      */
     idx_map(std::array<long, Rank> const &shape, // NOLINT (only throws if check_stride_order is true)
             std::array<long, Rank> const &strides) noexcept(!check_stride_order)
-       : len(shape), str(strides) {
+       : storage_(shape, strides) {
       EXPECTS(std::all_of(shape.cbegin(), shape.cend(), [](auto const &i) { return i >= 0; }));
+      assert_shape_matches_static_extents(shape);
       if constexpr (check_stride_order) {
         if (not is_stride_order_valid()) throw std::runtime_error("Error in nda::idx_map: Incompatible strides, shape and stride order");
       }
@@ -379,9 +518,9 @@ namespace nda {
      * @param shape Shape of the new map.
      */
     template <std::integral Int = long>
-    idx_map(std::array<Int, Rank> const &shape) noexcept : len(stdutil::make_std_array<long>(shape)) {
+    idx_map(std::array<Int, Rank> const &shape) noexcept : storage_(stdutil::make_std_array<long>(shape)) {
       EXPECTS(std::all_of(shape.cbegin(), shape.cend(), [](auto const &i) { return i >= 0; }));
-      assert_static_extents_and_len_are_compatible();
+      assert_shape_matches_static_extents(shape);
       compute_strides_contiguous();
     }
 
@@ -451,9 +590,12 @@ namespace nda {
       if constexpr (skip_stride and (I == stride_order[Rank - 1])) {
         // optimize for the case when the fastest varying dimension is contiguous in memory
         return arg;
+      } else if constexpr (is_fully_static) {
+        // fully static: use compile-time strides
+        return arg * static_strides[I];
       } else {
         // otherwise multiply the argument by the stride of the current dimension
-        return arg * std::get<I>(str);
+        return arg * std::get<I>(storage_.str);
       }
     }
 
@@ -471,9 +613,12 @@ namespace nda {
         if constexpr (smallest_stride_is_one) {
           // optimize for the case that the fastest varying dimension is contiguous in memory
           return (myget<true, Is>(static_cast<long>(args)) + ...);
+        } else if constexpr (is_fully_static) {
+          // fully static: use compile-time strides
+          return ((static_cast<long>(args) * static_strides[Is]) + ...);
         } else {
           // arbitrary layouts
-          return ((args * std::get<Is>(str)) + ...);
+          return ((static_cast<long>(args) * std::get<Is>(storage_.str)) + ...);
         }
       } else {
         // empty ellipsis is present and needs to be skipped
@@ -504,7 +649,7 @@ namespace nda {
     FORCEINLINE long operator()(Args const &...args) const
 #ifdef NDA_ENFORCE_BOUNDCHECK
        noexcept(false) {
-      assert_in_bounds(rank(), len.data(), args...);
+      assert_in_bounds(rank(), lengths().data(), args...);
 #else
        noexcept(true) {
 #endif
@@ -533,15 +678,16 @@ namespace nda {
      * @return Multi-dimensional index.
      */
     std::array<long, Rank> to_idx(long lin_idx) const {
+      auto const &s = strides();
       // compute residues starting from slowest index
       std::array<long, Rank> residues;
       residues[0] = lin_idx;
-      for (auto i : range(1, Rank)) { residues[i] = residues[i - 1] % str[stride_order[i - 1]]; }
+      for (auto i : range(1, Rank)) { residues[i] = residues[i - 1] % s[stride_order[i - 1]]; }
 
       // convert residues to indices, ordered from slowest to fastest
       std::array<long, Rank> idx;
-      idx[Rank - 1] = residues[Rank - 1] / str[stride_order[Rank - 1]];
-      for (auto i : range(Rank - 2, -1, -1)) { idx[i] = (residues[i] - residues[i + 1]) / str[stride_order[i]]; }
+      idx[Rank - 1] = residues[Rank - 1] / s[stride_order[Rank - 1]];
+      for (auto i : range(Rank - 2, -1, -1)) { idx[i] = (residues[i] - residues[i + 1]) / s[stride_order[i]]; }
 
       // reorder indices according to stride order
       return permutations::apply_inverse(stride_order, idx);
@@ -575,7 +721,7 @@ namespace nda {
      */
     template <int R, uint64_t SE, uint64_t SO, layout_prop_e LP>
     bool operator==(idx_map<R, SE, SO, LP> const &rhs) const {
-      return (Rank == R and len == rhs.lengths() and str == rhs.strides());
+      return (Rank == R and lengths() == rhs.lengths() and strides() == rhs.strides());
     }
 
     /**

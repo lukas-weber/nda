@@ -48,3 +48,27 @@ TEST(NDA, StackArraySlice) {
   EXPECT_ARRAY_NEAR(A, C1);
   EXPECT_ARRAY_NEAR(A_v2, C2);
 }
+
+TEST(NDA, StackArrayFromStaticRangeSlice) {
+  constexpr int N = 4;
+  nda::array<double, 2> mat(N, N);
+  for (int i = 0; i < N; ++i) {
+    for (int j = 0; j < N; ++j) { mat(i, j) = i * N + j; }
+  }
+
+  // Slicing with static_range<1, N> gives an (N-1) x (N-1) view
+  auto view = mat(nda::static_range<1, N>{}, nda::static_range<1, N>{});
+  EXPECT_EQ(view.shape()[0], N - 1);
+  EXPECT_EQ(view.shape()[1], N - 1);
+
+  // Constructing a stack_array with matching size should work
+  nda::stack_array<double, N - 1, N - 1> lmat(view);
+  EXPECT_EQ(lmat.shape()[0], N - 1);
+  EXPECT_EQ(lmat.shape()[1], N - 1);
+
+#ifndef NDEBUG
+  // Constructing a stack_array with wrong size should fail (std::terminate via EXPECTS)
+  // stack_array<double, N, N> expects shape (N, N), but view has shape (N-1, N-1)
+  EXPECT_DEATH(([&]() { nda::stack_array<double, N, N> wrong(view); }()), "");
+#endif
+}

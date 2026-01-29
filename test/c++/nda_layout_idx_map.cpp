@@ -402,3 +402,164 @@ TEST(NDA, IdxMapOtherSlices) {
   EXPECT_TRUE(slice6 == exp6);
   EXPECT_EQ(offset6, idxm3(0, 0, 0, 3, 2));
 }
+
+// ======================================================================================
+
+TEST(NDA, IdxMapCompileTimeLengthsAndStrides) {
+  // Fully static idx_map should have compile-time lengths and strides
+  using idxm_t = idx_map<3, encode(std::array{2, 3, 4}), C_stride_order<3>, layout_prop_e::contiguous>;
+
+  // Verify is_fully_static is true
+  static_assert(idxm_t::is_fully_static);
+
+  // Verify static_lengths at compile-time
+  static_assert(idxm_t::static_lengths[0] == 2);
+  static_assert(idxm_t::static_lengths[1] == 3);
+  static_assert(idxm_t::static_lengths[2] == 4);
+
+  // Verify static_strides at compile-time (C-order: last dimension has stride 1)
+  static_assert(idxm_t::static_strides[0] == 12); // 3 * 4
+  static_assert(idxm_t::static_strides[1] == 4);  // 4
+  static_assert(idxm_t::static_strides[2] == 1);  // 1
+
+  // Verify ce_size at compile-time
+  static_assert(idxm_t::ce_size() == 24);
+
+  // Runtime verification that lengths() and strides() return the same values
+  idxm_t idxm{};
+  EXPECT_EQ(idxm.lengths()[0], idxm_t::static_lengths[0]);
+  EXPECT_EQ(idxm.lengths()[1], idxm_t::static_lengths[1]);
+  EXPECT_EQ(idxm.lengths()[2], idxm_t::static_lengths[2]);
+  EXPECT_EQ(idxm.strides()[0], idxm_t::static_strides[0]);
+  EXPECT_EQ(idxm.strides()[1], idxm_t::static_strides[1]);
+  EXPECT_EQ(idxm.strides()[2], idxm_t::static_strides[2]);
+}
+
+TEST(NDA, IdxMapCompileTimeFortranOrder) {
+  // Fully static idx_map in Fortran order
+  using idxm_t = idx_map<3, encode(std::array{2, 3, 4}), Fortran_stride_order<3>, layout_prop_e::contiguous>;
+
+  static_assert(idxm_t::is_fully_static);
+
+  // Fortran-order: first dimension has stride 1
+  static_assert(idxm_t::static_strides[0] == 1);  // 1
+  static_assert(idxm_t::static_strides[1] == 2);  // 2
+  static_assert(idxm_t::static_strides[2] == 6);  // 2 * 3
+
+  idxm_t idxm{};
+  EXPECT_EQ(idxm.strides()[0], 1);
+  EXPECT_EQ(idxm.strides()[1], 2);
+  EXPECT_EQ(idxm.strides()[2], 6);
+}
+
+TEST(NDA, IdxMapDynamicNotFullyStatic) {
+  // idx_map with dynamic extents should NOT be fully static
+  using idxm_t = idx_map<3, 0, C_stride_order<3>, layout_prop_e::contiguous>;
+
+  static_assert(!idxm_t::is_fully_static);
+  static_assert(idxm_t::ce_size() == 0); // Dynamic size unknown at compile-time
+
+  EXPECT_TRUE(true);
+}
+
+TEST(NDA, IdxMapStridedNotFullyStatic) {
+  // idx_map with static extents but non-contiguous layout should NOT be fully static
+  // (strides cannot be computed from extents alone)
+  using idxm_t = idx_map<3, encode(std::array{2, 3, 4}), C_stride_order<3>, layout_prop_e::strided_1d>;
+
+  static_assert(!idxm_t::is_fully_static);
+
+  // But static_lengths should still be available
+  static_assert(idxm_t::static_lengths[0] == 2);
+  static_assert(idxm_t::static_lengths[1] == 3);
+  static_assert(idxm_t::static_lengths[2] == 4);
+
+  EXPECT_TRUE(true);
+}
+
+TEST(NDA, IdxMapStaticRangeSlicePreservesCompileTimeInfo) {
+  // Start with a fully static idx_map
+  using idxm_t = idx_map<3, encode(std::array{10, 8, 6}), C_stride_order<3>, layout_prop_e::contiguous>;
+  static_assert(idxm_t::is_fully_static);
+
+  idxm_t idxm{};
+
+  // Slice with static_range - should preserve static extent info in the result type
+  auto [offset1, slice1] = idxm.slice(static_range<2, 7>{}, range::all, static_range<1, 4>{});
+
+  // Check the resulting idx_map has static extents from the static_range
+  using slice1_t = decltype(slice1);
+  static_assert(slice1_t::static_extents[0] == 5);  // static_range<2, 7> -> extent 5
+  static_assert(slice1_t::static_extents[1] == 8);  // range::all preserves original static extent
+  static_assert(slice1_t::static_extents[2] == 3);  // static_range<1, 4> -> extent 3
+
+  // The result should also be fully static if contiguous
+  static_assert(slice1_t::n_dynamic_extents == 0);
+
+  // Verify static_lengths are set correctly
+  static_assert(slice1_t::static_lengths[0] == 5);
+  static_assert(slice1_t::static_lengths[1] == 8);
+  static_assert(slice1_t::static_lengths[2] == 3);
+
+  // Runtime verification
+  EXPECT_EQ(slice1.lengths()[0], 5);
+  EXPECT_EQ(slice1.lengths()[1], 8);
+  EXPECT_EQ(slice1.lengths()[2], 3);
+  EXPECT_EQ(offset1, idxm(2, 0, 1));
+}
+
+TEST(NDA, IdxMapStaticRangeSliceWithStep) {
+  // Fully static idx_map
+  using idxm_t = idx_map<2, encode(std::array{10, 10}), C_stride_order<2>, layout_prop_e::contiguous>;
+  idxm_t idxm{};
+
+  // Slice with static_range with step > 1
+  auto [offset, slice] = idxm.slice(static_range<0, 10, 2>{}, range::all);
+
+  using slice_t = decltype(slice);
+  static_assert(slice_t::static_extents[0] == 5);   // (10 - 0 + 2 - 1) / 2 = 5
+  static_assert(slice_t::static_extents[1] == 10);  // range::all preserves extent
+
+  // Step != 1 means not contiguous, so strides may not be computable at compile-time
+  // But static_lengths should still be available
+  static_assert(slice_t::static_lengths[0] == 5);
+  static_assert(slice_t::static_lengths[1] == 10);
+
+  EXPECT_EQ(slice.lengths()[0], 5);
+  EXPECT_EQ(slice.lengths()[1], 10);
+}
+
+TEST(NDA, IdxMapStaticRangeReducesDimension) {
+  // Slice that reduces dimension (long index) combined with static_range
+  using idxm_t = idx_map<3, encode(std::array{10, 8, 6}), C_stride_order<3>, layout_prop_e::contiguous>;
+  idxm_t idxm{};
+
+  // static_range + long index + range::all -> 2D result
+  auto [offset, slice] = idxm.slice(static_range<2, 5>{}, 3L, range::all);
+
+  using slice_t = decltype(slice);
+  static_assert(slice_t::rank() == 2);
+  static_assert(slice_t::static_extents[0] == 3);  // static_range<2, 5>
+  static_assert(slice_t::static_extents[1] == 6);  // range::all preserves 6
+
+  EXPECT_EQ(slice.lengths()[0], 3);
+  EXPECT_EQ(slice.lengths()[1], 6);
+  EXPECT_EQ(offset, idxm(2, 3, 0));
+}
+
+TEST(NDA, IdxMapFullyStaticShapeMismatch) {
+  // Constructing a fully static idx_map with wrong shape should fail at runtime
+  using idxm_t = idx_map<2, encode(std::array{4, 4}), C_stride_order<2>, layout_prop_e::contiguous>;
+  static_assert(idxm_t::is_fully_static);
+
+  // Correct shape should work
+  idxm_t idxm1{std::array<long, 2>{4, 4}};
+  EXPECT_EQ(idxm1.lengths()[0], 4);
+  EXPECT_EQ(idxm1.lengths()[1], 4);
+
+#ifndef NDEBUG
+  // Wrong shape should trigger assertion failure (std::terminate via EXPECTS)
+  auto wrong_shape = std::array<long, 2>{3, 3};
+  EXPECT_DEATH(idxm_t{wrong_shape}, "");
+#endif
+}

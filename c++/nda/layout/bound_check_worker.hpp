@@ -54,6 +54,18 @@ namespace nda::detail {
     // Check the bounds when an nda::ellipsis is encountered (no need to check anything).
     void check_current_dim(ellipsis) { N += ellipsis_loss + 1; }
 
+    // Check if the given nda::static_range is within the bounds of the array/view.
+    template <long First, long Last, long Step>
+    void check_current_dim(static_range<First, Last, Step>) {
+      constexpr long extent = static_range<First, Last, Step>::extent();
+      if (extent > 0) {
+        constexpr long first_idx = First;
+        constexpr long last_idx  = First + (extent - 1) * Step;
+        if (first_idx < 0 or first_idx >= lengths[N] or last_idx < 0 or last_idx >= lengths[N]) error_code += 1ul << N;
+      }
+      ++N;
+    }
+
     // Accumulate an error message for the current dimension and index.
     void accumulate_error_msg(std::stringstream &fs, long idx) {
       if (error_code & (1ull << N)) fs << "Argument " << N << " = " << idx << " is not within [0," << lengths[N] << "[.\n";
@@ -71,6 +83,15 @@ namespace nda::detail {
 
     // Accumulate an error message for the current dimension and nda::ellipsis.
     void accumulate_error_msg(std::stringstream &, ellipsis) { N += ellipsis_loss + 1; }
+
+    // Accumulate an error message for the current dimension and nda::static_range.
+    template <long First, long Last, long Step>
+    void accumulate_error_msg(std::stringstream &fs, static_range<First, Last, Step>) {
+      if (error_code & (1ull << N)) {
+        fs << "Argument " << N << " = static_range<" << First << ", " << Last << ", " << Step << "> is not within [0," << lengths[N] << "[.\n";
+      }
+      ++N;
+    }
   };
 
 } // namespace nda::detail

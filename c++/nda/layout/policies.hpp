@@ -93,21 +93,36 @@ namespace nda {
     using contiguous_t = F_layout;
   };
 
+  namespace detail {
+
+    // Helper to resolve static strides for a given rank.
+    // If the provided strides array has the correct size, use it; otherwise return an empty array.
+    template <int Rank, auto Strides>
+    constexpr auto resolve_static_strides() {
+      if constexpr (Strides.size() == static_cast<size_t>(Rank))
+        return Strides;
+      else
+        return std::array<long, Rank>{};
+    }
+
+  } // namespace detail
+
   /**
    * @brief Generic layout policy with arbitrary order.
    *
    * @tparam StaticExtent Compile-time known shape.
    * @tparam StrideOrder Order in which the dimensions are stored in memory.
    * @tparam LayoutProp Compile-time guarantees about the layout of the data in memory.
+   * @tparam StaticStridesParam Compile-time known strides (optional, default is empty).
    */
-  template <uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+  template <uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp, auto StaticStridesParam = std::array<long, 0>{}>
   struct basic_layout {
     /// Multi-dimensional to flat index mapping.
     template <int Rank>
-    using mapping = idx_map<Rank, StaticExtents, StrideOrder, LayoutProp>;
+    using mapping = idx_map<Rank, StaticExtents, StrideOrder, LayoutProp, detail::resolve_static_strides<Rank, StaticStridesParam>()>;
 
     /// The same layout policy, but with no guarantee of contiguity.
-    using with_lowest_guarantee_t = basic_layout<StaticExtents, StrideOrder, layout_prop_e::none>;
+    using with_lowest_guarantee_t = basic_layout<StaticExtents, StrideOrder, layout_prop_e::none, StaticStridesParam>;
 
     /// The same layout policy, but with guarantee of contiguity.
     using contiguous_t = basic_layout<StaticExtents, StrideOrder, layout_prop_e::contiguous>;
@@ -139,35 +154,54 @@ namespace nda {
     struct layout_to_policy;
     /// @endcond
 
-    // Get the correct layout policy given a general nda::idx_map.
+    // Helper to check if an idx_map matches C_layout
     template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
-    struct layout_to_policy<idx_map<Rank, StaticExtents, StrideOrder, LayoutProp>> {
-      using type = basic_layout<StaticExtents, StrideOrder, LayoutProp>;
+    constexpr bool is_c_layout_v = (StaticExtents == 0) && (StrideOrder == C_stride_order<Rank>) && (LayoutProp == layout_prop_e::contiguous);
+
+    // Helper to check if an idx_map matches F_layout
+    template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+    constexpr bool is_f_layout_v = (Rank > 1) && (StaticExtents == 0) && (StrideOrder == Fortran_stride_order<Rank>) && (LayoutProp == layout_prop_e::contiguous);
+
+    // Helper to check if an idx_map matches C_stride_layout
+    template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+    constexpr bool is_c_stride_layout_v = (StaticExtents == 0) && (StrideOrder == C_stride_order<Rank>) && (LayoutProp == layout_prop_e::none);
+
+    // Helper to check if an idx_map matches F_stride_layout
+    template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp>
+    constexpr bool is_f_stride_layout_v = (Rank > 1) && (StaticExtents == 0) && (StrideOrder == Fortran_stride_order<Rank>) && (LayoutProp == layout_prop_e::none);
+
+    // Get the correct layout policy given a general nda::idx_map.
+    template <int Rank, uint64_t StaticExtents, uint64_t StrideOrder, layout_prop_e LayoutProp, auto StaticStrides>
+      requires(!is_c_layout_v<Rank, StaticExtents, StrideOrder, LayoutProp> && !is_f_layout_v<Rank, StaticExtents, StrideOrder, LayoutProp>
+               && !is_c_stride_layout_v<Rank, StaticExtents, StrideOrder, LayoutProp>
+               && !is_f_stride_layout_v<Rank, StaticExtents, StrideOrder, LayoutProp>)
+    struct layout_to_policy<idx_map<Rank, StaticExtents, StrideOrder, LayoutProp, StaticStrides>> {
+      using type = basic_layout<StaticExtents, StrideOrder, LayoutProp, StaticStrides>;
     };
 
     // Get the correct layout policy given a contiguous nda::idx_map with C-order.
-    template <int Rank>
-    struct layout_to_policy<idx_map<Rank, 0, C_stride_order<Rank>, layout_prop_e::contiguous>> {
+    template <int Rank, auto StaticStrides>
+    struct layout_to_policy<idx_map<Rank, 0, C_stride_order<Rank>, layout_prop_e::contiguous, StaticStrides>> {
       using type = C_layout;
     };
 
     // Get the correct layout policy given a strided nda::idx_map with C-order.
-    template <int Rank>
-    struct layout_to_policy<idx_map<Rank, 0, C_stride_order<Rank>, layout_prop_e::none>> {
+    template <int Rank, auto StaticStrides>
+    struct layout_to_policy<idx_map<Rank, 0, C_stride_order<Rank>, layout_prop_e::none, StaticStrides>> {
       using type = C_stride_layout;
     };
 
     // Get the correct layout policy given a contiguous nda::idx_map with Fortran-order.
-    template <int Rank>
+    template <int Rank, auto StaticStrides>
       requires(Rank > 1)
-    struct layout_to_policy<idx_map<Rank, 0, Fortran_stride_order<Rank>, layout_prop_e::contiguous>> {
+    struct layout_to_policy<idx_map<Rank, 0, Fortran_stride_order<Rank>, layout_prop_e::contiguous, StaticStrides>> {
       using type = F_layout;
     };
 
     // Get the correct layout policy given a strided nda::idx_map with Fortran-order.
-    template <int Rank>
+    template <int Rank, auto StaticStrides>
       requires(Rank > 1)
-    struct layout_to_policy<idx_map<Rank, 0, Fortran_stride_order<Rank>, layout_prop_e::none>> {
+    struct layout_to_policy<idx_map<Rank, 0, Fortran_stride_order<Rank>, layout_prop_e::none, StaticStrides>> {
       using type = F_stride_layout;
     };
 
