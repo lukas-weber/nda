@@ -446,3 +446,39 @@ TEST(TENSOR, reduce) { test_reduce<double, C_layout>(); }     //NOLINT
 TEST(TENSOR, reduceF) { test_reduce<double, F_layout>(); }    //NOLINT
 TEST(TENSOR, reducez) { test_reduce<dcomplex, C_layout>(); }  //NOLINT
 TEST(TENSOR, zreduceF) { test_reduce<dcomplex, F_layout>(); } //NOLINT
+
+//----------------------------
+
+TEST(TENSOR, plan_cache) { //NOLINT
+  nda::tensor::cutensor::clear_plan_cache();
+  EXPECT_EQ(nda::tensor::cutensor::plan_cache_size(), std::size_t{0});
+
+  nda::matrix<double> M1{{0, 1}, {1, 2}}, M2{{1, 1}, {1, 1}}, M3{{1, 0}, {0, 1}};
+  nda::cumatrix<double> M1_d{M1}, M2_d{M2}, M3_d{M3};
+
+  // repeating the same operation reuses the plan
+  nda::tensor::contract(1.0, M1_d, "ik", M2_d, "kj", 0.0, M3_d, "ij");
+  EXPECT_EQ(nda::tensor::cutensor::plan_cache_size(), std::size_t{1});
+  nda::tensor::contract(2.0, M1_d, "ik", M2_d, "kj", 1.0, M3_d, "ij");
+  EXPECT_EQ(nda::tensor::cutensor::plan_cache_size(), std::size_t{1});
+
+  // ... and the results are unaffected by the reuse
+  M3 = M3_d;
+  EXPECT_ARRAY_NEAR(M3, nda::matrix<double>{{3, 3}, {9, 9}});
+
+  // a different index pattern needs its own plan
+  nda::tensor::contract(1.0, M1_d, "ik", M2_d, "jk", 0.0, M3_d, "ij");
+  EXPECT_EQ(nda::tensor::cutensor::plan_cache_size(), std::size_t{2});
+
+  // ... as does a different shape
+  nda::matrix<double> N1(3, 3), N2(3, 3), N3(3, 3);
+  N1() = 1;
+  N2() = 1;
+  N3() = 0;
+  nda::cumatrix<double> N1_d{N1}, N2_d{N2}, N3_d{N3};
+  nda::tensor::contract(1.0, N1_d, "ik", N2_d, "kj", 0.0, N3_d, "ij");
+  EXPECT_EQ(nda::tensor::cutensor::plan_cache_size(), std::size_t{3});
+
+  nda::tensor::cutensor::clear_plan_cache();
+  EXPECT_EQ(nda::tensor::cutensor::plan_cache_size(), std::size_t{0});
+}

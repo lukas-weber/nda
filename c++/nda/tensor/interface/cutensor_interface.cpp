@@ -24,40 +24,45 @@
 
 #include "nda/tensor/interface/cutensor_interface.hpp"
 
-// use by default for now...
-//#define USE_CUTENSOR_CACHE
-
 namespace nda::tensor::cutensor {
 
-  cutensorHandle_t &get_handle_ptr() {
+  namespace {
+
+    /*
+     * Owns the cutensor handle and the plan cache. The cache is cleared explicitly in
+     * the destructor: the body of ~handle_t runs before the member destructors, so
+     * otherwise the plans would be destroyed after cutensorDestroy.
+     */
     struct handle_t {
-      handle_t() {
-        cutensorCreate(&h);
-#if defined(USE_CUTENSOR_CACHE)
-        constexpr int32_t numCachelines = 1024;
-        const size_t sizeCache          = numCachelines * sizeof(cutensorPlanCacheline_t);
-        cachelines                      = (cutensorPlanCacheline_t *)malloc(sizeCache);
-        CUTENSOR_CHECK(cutensorHandleAttachPlanCachelines, &h, cachelines, numCachelines);
-#endif
-      }
+      handle_t() { cutensorCreate(&h); }
       ~handle_t() {
-#if defined(USE_CUTENSOR_CACHE)
-        CUTENSOR_CHECK(cutensorHandleDetachPlanCachelines, &h);
-        free(cachelines);
-#endif
+        cache.clear();
         CUTENSOR_CHECK(cutensorDestroy, h);
       }
 
-      cutensorHandle_t h = {};
+      handle_t(handle_t const &)            = delete;
+      handle_t(handle_t &&)                 = delete;
+      handle_t &operator=(handle_t const &) = delete;
+      handle_t &operator=(handle_t &&)      = delete;
 
-      private:
-#if defined(USE_CUTENSOR_CACHE)
-      cutensorPlanCacheline_t *cachelines;
-#endif
+      cutensorHandle_t h = {};
+      plan_cache_t cache = {};
     };
-    static handle_t h = {};
-    return h.h;
-  }
+
+    handle_t &get_handle() {
+      static handle_t h;
+      return h;
+    }
+
+  } // namespace
+
+  cutensorHandle_t &get_handle_ptr() { return get_handle().h; }
+
+  plan_cache_t &get_plan_cache() { return get_handle().cache; }
+
+  void clear_plan_cache() { get_handle().cache.clear(); }
+
+  std::size_t plan_cache_size() { return get_handle().cache.size(); }
 
   // control device synchronization during cutensor calls
   bool synchronize = true;
